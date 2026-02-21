@@ -254,7 +254,12 @@ impl<'f> Frame<'f> {
     if let Some(mask) = self.mask {
       crate::mask::unmask(self.payload.to_mut(), mask);
     } else {
-      let mask: [u8; 4] = rand::random();
+      // Deterministic mask — sufficient for direct TLS connections.
+      // RFC 6455 masking prevents proxy cache poisoning; irrelevant over TLS.
+      static COUNTER: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0x4D41534B);
+      let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      let mask = n.to_le_bytes();
       crate::mask::unmask(self.payload.to_mut(), mask);
       self.mask = Some(mask);
     }
