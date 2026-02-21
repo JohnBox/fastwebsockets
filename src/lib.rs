@@ -594,7 +594,7 @@ const MAX_HEADER_SIZE: usize = 14;
 
 impl ReadHalf {
   pub fn after_handshake(role: Role) -> Self {
-    let buffer = BytesMut::with_capacity(8192);
+    let buffer = BytesMut::with_capacity(16384);
 
     Self {
       role,
