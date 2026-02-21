@@ -299,7 +299,7 @@ impl<'f, S> WebSocketRead<S> {
   pub async fn read_frame<R, E>(
     &mut self,
     send_fn: &mut impl FnMut(Frame<'f>) -> R,
-  ) -> Result<Frame, WebSocketError>
+  ) -> Result<Frame<'_>, WebSocketError>
   where
     S: AsyncRead + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
@@ -442,6 +442,7 @@ impl<'f, S> WebSocket<S> {
   }
 
   /// Consumes the `WebSocket` and returns the underlying stream.
+  #[cfg(any(feature = "unstable-split", feature = "fragment"))]
   #[inline]
   pub(crate) fn into_parts_internal(self) -> (S, ReadHalf, WriteHalf) {
     (self.stream, self.read_half, self.write_half)
@@ -759,6 +760,7 @@ impl ReadHalf {
   /// has been closed.
   ///
   /// XXX: Do not expose this method to the public API.
+  #[cfg(any(feature = "unstable-split", feature = "fragment"))]
   #[inline(always)]
   pub(crate) async fn read_frame_inner<'f, S>(
     &mut self,
@@ -822,6 +824,7 @@ impl ReadHalf {
     }
   }
 
+  #[cfg(any(feature = "unstable-split", feature = "fragment"))]
   #[inline(always)]
   async fn parse_frame_header<'a, S>(
     &mut self,
