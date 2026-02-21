@@ -50,7 +50,7 @@ hyper = { version = "1", features = [
 pin-project = { version = "1.0.8", optional = true }
 base64 = { version = "0.22.0", optional = true }
 sha1 = { version = "0.10.5", optional = true }
-utf-8 = "0.7.5"
+utf-8 = { version = "0.7.5", optional = true }
 thiserror = "1.0.40"
 bytes = "1.5.0"
 
@@ -60,7 +60,8 @@ http = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [features]
-default = ["simd"]
+default = ["simd", "fragment"]
+fragment = ["utf-8"]
 upgrade = [
     "hyper",
     "pin-project",

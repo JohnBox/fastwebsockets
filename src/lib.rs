@@ -152,6 +152,7 @@
 
 mod close;
 mod error;
+#[cfg(feature = "fragment")]
 mod fragment;
 mod frame;
 /// Client handshake.
@@ -177,8 +178,9 @@ use tokio::io::AsyncWriteExt;
 
 pub use crate::close::CloseCode;
 pub use crate::error::WebSocketError;
+#[cfg(feature = "fragment")]
 pub use crate::fragment::FragmentCollector;
-#[cfg(feature = "unstable-split")]
+#[cfg(all(feature = "fragment", feature = "unstable-split"))]
 pub use crate::fragment::FragmentCollectorRead;
 pub use crate::frame::Frame;
 pub use crate::frame::OpCode;
