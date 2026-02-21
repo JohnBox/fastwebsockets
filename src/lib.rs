@@ -168,6 +168,7 @@ pub mod upgrade;
 use bytes::Buf;
 
 use bytes::BytesMut;
+use std::ptr;
 #[cfg(feature = "unstable-split")]
 use std::future::Future;
 
@@ -588,8 +589,10 @@ impl<'f, S> WebSocket<S> {
         eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
       }
 
-      let b0 = self.read_half.buffer[0];
-      let b1 = self.read_half.buffer[1];
+      let base = self.read_half.buffer.chunk().as_ptr();
+      // SAFETY: remaining() >= 2 guaranteed above
+      let b0 = unsafe { *base };
+      let b1 = unsafe { *base.add(1) };
 
       if b0 & RSV_MASK != 0 {
         return Err(WebSocketError::ReservedBitsNotZero);
@@ -600,35 +603,52 @@ impl<'f, S> WebSocket<S> {
       let masked = b1 & MASK_BIT != 0;
 
       let length_code = b1 & LEN_MASK;
-      let extra = match length_code {
+      let extra: usize = match length_code {
         LEN_U16 => 2,
         LEN_U64 => 8,
         _ => 0,
       };
+      let mask_size = masked as usize * 4;
 
-      self.read_half.buffer.advance(2);
-      while self.read_half.buffer.remaining() < extra + masked as usize * 4 {
+      // Single wait for length + mask bytes (folded from two separate waits)
+      while self.read_half.buffer.remaining() < 2 + extra + mask_size {
         eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
       }
 
+      // Re-acquire pointer (read_buf may have reallocated)
+      let base = self.read_half.buffer.chunk().as_ptr();
+
+      // SAFETY: remaining() >= 2 + extra + mask_size guaranteed above
       let payload_len: usize = match extra {
         0 => usize::from(length_code),
-        2 => self.read_half.buffer.get_u16() as usize,
+        2 => u16::from_be(unsafe {
+          ptr::read_unaligned(base.add(2) as *const u16)
+        }) as usize,
         #[cfg(target_pointer_width = "64")]
-        8 => self.read_half.buffer.get_u64() as usize,
+        8 => u64::from_be(unsafe {
+          ptr::read_unaligned(base.add(2) as *const u64)
+        }) as usize,
         #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-        8 => match usize::try_from(self.read_half.buffer.get_u64()) {
+        8 => match usize::try_from(u64::from_be(unsafe {
+          ptr::read_unaligned(base.add(2) as *const u64)
+        })) {
           Ok(length) => length,
           Err(_) => return Err(WebSocketError::FrameTooLarge),
         },
-        _ => unreachable!(),
+        // SAFETY: extra is computed from length_code match; only 0, 2, 8 are possible
+        _ => unsafe { core::hint::unreachable_unchecked() },
       };
 
-      let mask = if masked {
-        Some(self.read_half.buffer.get_u32().to_be_bytes())
+      let mask = if mask_size > 0 {
+        // SAFETY: remaining() >= 2 + extra + mask_size, so 4 bytes at offset 2+extra are valid
+        Some(unsafe {
+          ptr::read_unaligned(base.add(2 + extra) as *const [u8; 4])
+        })
       } else {
         None
       };
+
+      self.read_half.buffer.advance(2 + extra + mask_size);
 
       if frame::is_control(opcode) && !fin {
         return Err(WebSocketError::ControlFrameFragmented);
@@ -846,8 +866,10 @@ impl ReadHalf {
       eof!(stream.read_buf(&mut self.buffer).await?);
     }
 
-    let b0 = self.buffer[0];
-    let b1 = self.buffer[1];
+    let base = self.buffer.chunk().as_ptr();
+    // SAFETY: remaining() >= 2 guaranteed above
+    let b0 = unsafe { *base };
+    let b1 = unsafe { *base.add(1) };
 
     if b0 & RSV_MASK != 0 {
       return Err(WebSocketError::ReservedBitsNotZero);
@@ -858,36 +880,52 @@ impl ReadHalf {
     let masked = b1 & MASK_BIT != 0;
 
     let length_code = b1 & LEN_MASK;
-    let extra = match length_code {
+    let extra: usize = match length_code {
       LEN_U16 => 2,
       LEN_U64 => 8,
       _ => 0,
     };
+    let mask_size = masked as usize * 4;
 
-    self.buffer.advance(2);
-    while self.buffer.remaining() < extra + masked as usize * 4 {
+    // Single wait for length + mask bytes (folded from two separate waits)
+    while self.buffer.remaining() < 2 + extra + mask_size {
       eof!(stream.read_buf(&mut self.buffer).await?);
     }
 
+    // Re-acquire pointer (read_buf may have reallocated)
+    let base = self.buffer.chunk().as_ptr();
+
+    // SAFETY: remaining() >= 2 + extra + mask_size guaranteed above
     let payload_len: usize = match extra {
       0 => usize::from(length_code),
-      2 => self.buffer.get_u16() as usize,
+      2 => u16::from_be(unsafe {
+        ptr::read_unaligned(base.add(2) as *const u16)
+      }) as usize,
       #[cfg(target_pointer_width = "64")]
-      8 => self.buffer.get_u64() as usize,
-      // On 32bit systems, usize is only 4bytes wide so we must check for usize overflowing
+      8 => u64::from_be(unsafe {
+        ptr::read_unaligned(base.add(2) as *const u64)
+      }) as usize,
       #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
-      8 => match usize::try_from(self.buffer.get_u64()) {
+      8 => match usize::try_from(u64::from_be(unsafe {
+        ptr::read_unaligned(base.add(2) as *const u64)
+      })) {
         Ok(length) => length,
         Err(_) => return Err(WebSocketError::FrameTooLarge),
       },
-      _ => unreachable!(),
+      // SAFETY: extra is computed from length_code match; only 0, 2, 8 are possible
+      _ => unsafe { core::hint::unreachable_unchecked() },
     };
 
-    let mask = if masked {
-      Some(self.buffer.get_u32().to_be_bytes())
+    let mask = if mask_size > 0 {
+      // SAFETY: remaining() >= 2 + extra + mask_size, so 4 bytes at offset 2+extra are valid
+      Some(unsafe {
+        ptr::read_unaligned(base.add(2 + extra) as *const [u8; 4])
+      })
     } else {
       None
     };
+
+    self.buffer.advance(2 + extra + mask_size);
 
     if frame::is_control(opcode) && !fin {
       return Err(WebSocketError::ControlFrameFragmented);
