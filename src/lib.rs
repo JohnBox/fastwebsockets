@@ -205,6 +205,7 @@ pub(crate) struct ReadHalf {
   auto_apply_mask: bool,
   auto_close: bool,
   auto_pong: bool,
+  auto_validate_utf8: bool,
   writev_threshold: usize,
   max_message_size: usize,
   buffer: BytesMut,
@@ -283,6 +284,13 @@ impl<'f, S> WebSocketRead<S> {
   /// Default: `true`
   pub fn set_auto_apply_mask(&mut self, auto_apply_mask: bool) {
     self.read_half.auto_apply_mask = auto_apply_mask;
+  }
+
+  /// Sets whether to automatically validate UTF-8 for text frames.
+  ///
+  /// Default: `true`
+  pub fn set_auto_validate_utf8(&mut self, v: bool) {
+    self.read_half.auto_validate_utf8 = v;
   }
 
   /// Reads a frame from the stream.
@@ -478,6 +486,17 @@ impl<'f, S> WebSocket<S> {
     self.write_half.auto_apply_mask = auto_apply_mask;
   }
 
+  /// Sets whether to automatically validate UTF-8 for text frames.
+  ///
+  /// When disabled, text frames are returned without UTF-8 validation,
+  /// which avoids a full pass over the payload. Useful when the caller
+  /// processes payloads as raw bytes.
+  ///
+  /// Default: `true`
+  pub fn set_auto_validate_utf8(&mut self, v: bool) {
+    self.read_half.auto_validate_utf8 = v;
+  }
+
   pub fn is_closed(&self) -> bool {
     self.write_half.closed
   }
@@ -582,6 +601,7 @@ impl ReadHalf {
       auto_apply_mask: true,
       auto_close: true,
       auto_pong: true,
+      auto_validate_utf8: true,
       writev_threshold: 1024,
       max_message_size: 64 << 20,
       buffer,
@@ -646,7 +666,7 @@ impl ReadHalf {
         (Ok(None), Some(Frame::pong(frame.payload)))
       }
       OpCode::Text => {
-        if frame.fin && !frame.is_utf8() {
+        if self.auto_validate_utf8 && frame.fin && !frame.is_utf8() {
           (Err(WebSocketError::InvalidUTF8), None)
         } else {
           (Ok(Some(frame)), None)
