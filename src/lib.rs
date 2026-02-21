@@ -614,6 +614,7 @@ impl ReadHalf {
   /// has been closed.
   ///
   /// XXX: Do not expose this method to the public API.
+  #[inline(always)]
   pub(crate) async fn read_frame_inner<'f, S>(
     &mut self,
     stream: &mut S,
@@ -676,6 +677,7 @@ impl ReadHalf {
     }
   }
 
+  #[inline(always)]
   async fn parse_frame_header<'a, S>(
     &mut self,
     stream: &mut S,

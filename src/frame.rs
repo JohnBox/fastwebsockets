@@ -57,6 +57,7 @@ impl<'a> core::fmt::Debug for Payload<'a> {
 impl Deref for Payload<'_> {
   type Target = [u8];
 
+  #[inline(always)]
   fn deref(&self) -> &Self::Target {
     match self {
       Payload::Borrowed(borrowed) => borrowed,
@@ -142,6 +143,7 @@ const MAX_HEAD_SIZE: usize = 16;
 
 impl<'f> Frame<'f> {
   /// Creates a new WebSocket `Frame`.
+  #[inline(always)]
   pub fn new(
     fin: bool,
     opcode: OpCode,
@@ -239,6 +241,7 @@ impl<'f> Frame<'f> {
   }
 
   /// Checks if the frame payload is valid UTF-8.
+  #[inline(always)]
   pub fn is_utf8(&self) -> bool {
     #[cfg(feature = "simd")]
     return simdutf8::basic::from_utf8(&self.payload).is_ok();
@@ -361,7 +364,7 @@ repr_u8! {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn is_control(opcode: OpCode) -> bool {
   matches!(opcode, OpCode::Close | OpCode::Ping | OpCode::Pong)
 }
