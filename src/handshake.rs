@@ -119,7 +119,13 @@ where
 pub fn generate_key() -> String {
   // a base64-encoded (see Section 4 of [RFC4648]) value that,
   // when decoded, is 16 bytes in length (RFC 6455)
-  let r: [u8; 16] = rand::random();
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static CTR: AtomicU64 = AtomicU64::new(0x5765_6253_6F63_6B65);
+  let a = CTR.fetch_add(1, Ordering::Relaxed);
+  let b = a.wrapping_mul(0x517cc1b727220a95);
+  let mut r = [0u8; 16];
+  r[..8].copy_from_slice(&a.to_le_bytes());
+  r[8..].copy_from_slice(&b.to_le_bytes());
   STANDARD.encode(r)
 }
 

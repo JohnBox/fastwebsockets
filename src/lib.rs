@@ -573,26 +573,169 @@ impl<'f, S> WebSocket<S> {
   where
     S: AsyncRead + AsyncWrite + Unpin,
   {
+    macro_rules! eof {
+      ($n:expr) => {{
+        if $n == 0 {
+          return Err(WebSocketError::UnexpectedEOF);
+        }
+      }};
+    }
+
     loop {
-      let (res, obligated_send) =
-        self.read_half.read_frame_inner(&mut self.stream).await;
-      let is_closed = self.write_half.closed;
-      if let Some(frame) = obligated_send {
-        if !is_closed {
-          self.write_half.write_frame(&mut self.stream, frame).await?;
-        }
+      // --- parse frame header ---
+      while self.read_half.buffer.remaining() < 2 {
+        eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
       }
-      if let Some(frame) = res? {
-        if is_closed && frame.opcode != OpCode::Close {
-          return Err(WebSocketError::ConnectionClosed);
+
+      let b0 = self.read_half.buffer[0];
+      let b1 = self.read_half.buffer[1];
+
+      if b0 & RSV_MASK != 0 {
+        return Err(WebSocketError::ReservedBitsNotZero);
+      }
+
+      let fin = b0 & FIN_BIT != 0;
+      let opcode = frame::OpCode::try_from(b0 & OPCODE_MASK)?;
+      let masked = b1 & MASK_BIT != 0;
+
+      let length_code = b1 & LEN_MASK;
+      let extra = match length_code {
+        LEN_U16 => 2,
+        LEN_U64 => 8,
+        _ => 0,
+      };
+
+      self.read_half.buffer.advance(2);
+      while self.read_half.buffer.remaining() < extra + masked as usize * 4 {
+        eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
+      }
+
+      let payload_len: usize = match extra {
+        0 => usize::from(length_code),
+        2 => self.read_half.buffer.get_u16() as usize,
+        #[cfg(target_pointer_width = "64")]
+        8 => self.read_half.buffer.get_u64() as usize,
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        8 => match usize::try_from(self.read_half.buffer.get_u64()) {
+          Ok(length) => length,
+          Err(_) => return Err(WebSocketError::FrameTooLarge),
+        },
+        _ => unreachable!(),
+      };
+
+      let mask = if masked {
+        Some(self.read_half.buffer.get_u32().to_be_bytes())
+      } else {
+        None
+      };
+
+      if frame::is_control(opcode) && !fin {
+        return Err(WebSocketError::ControlFrameFragmented);
+      }
+
+      if opcode == OpCode::Ping && payload_len > MAX_CONTROL_PAYLOAD {
+        return Err(WebSocketError::PingFrameTooLarge);
+      }
+
+      if payload_len >= self.read_half.max_message_size {
+        return Err(WebSocketError::FrameTooLarge);
+      }
+
+      self.read_half.buffer.reserve(payload_len + MAX_HEADER_SIZE);
+      while payload_len > self.read_half.buffer.remaining() {
+        eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
+      }
+
+      let payload = self.read_half.buffer.split_to(payload_len);
+      let mut frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
+
+      // --- opcode dispatch ---
+      if self.read_half.role == Role::Server && self.read_half.auto_apply_mask {
+        frame.unmask();
+      }
+
+      match frame.opcode {
+        OpCode::Close if self.read_half.auto_close => {
+          match frame.payload.len() {
+            0 => {}
+            1 => return Err(WebSocketError::InvalidCloseFrame),
+            _ => {
+              let code = close::CloseCode::from(u16::from_be_bytes(
+                frame.payload[0..2].try_into().unwrap(),
+              ));
+
+              #[cfg(feature = "simd")]
+              if simdutf8::basic::from_utf8(&frame.payload[2..]).is_err() {
+                return Err(WebSocketError::InvalidUTF8);
+              };
+
+              #[cfg(not(feature = "simd"))]
+              if std::str::from_utf8(&frame.payload[2..]).is_err() {
+                return Err(WebSocketError::InvalidUTF8);
+              };
+
+              if !code.is_allowed() {
+                if !self.write_half.closed {
+                  self
+                    .write_half
+                    .write_frame(
+                      &mut self.stream,
+                      Frame::close(1002, &frame.payload[2..]),
+                    )
+                    .await?;
+                }
+                return Err(WebSocketError::InvalidCloseCode);
+              }
+            }
+          };
+
+          if !self.write_half.closed {
+            let reply = Frame::close_raw(frame.payload.to_owned().into());
+            self
+              .write_half
+              .write_frame(&mut self.stream, reply)
+              .await?;
+          }
+          return Ok(frame);
         }
-        break Ok(frame);
+        OpCode::Ping if self.read_half.auto_pong => {
+          if !self.write_half.closed {
+            self
+              .write_half
+              .write_frame(&mut self.stream, Frame::pong(frame.payload))
+              .await?;
+          }
+          continue;
+        }
+        OpCode::Text
+          if self.read_half.auto_validate_utf8
+            && frame.fin
+            && !frame.is_utf8() =>
+        {
+          return Err(WebSocketError::InvalidUTF8);
+        }
+        _ => {
+          if self.write_half.closed && frame.opcode != OpCode::Close {
+            return Err(WebSocketError::ConnectionClosed);
+          }
+          return Ok(frame);
+        }
       }
     }
   }
 }
 
 const MAX_HEADER_SIZE: usize = 14;
+
+// WebSocket frame header bit masks and markers (RFC 6455 §5.2)
+const FIN_BIT: u8 = 0x80;
+const RSV_MASK: u8 = 0x70;
+const OPCODE_MASK: u8 = 0x0F;
+const MASK_BIT: u8 = 0x80;
+const LEN_MASK: u8 = 0x7F;
+const LEN_U16: u8 = 126;
+const LEN_U64: u8 = 127;
+const MAX_CONTROL_PAYLOAD: usize = 125;
 
 impl ReadHalf {
   pub fn after_handshake(role: Role) -> Self {
@@ -700,22 +843,21 @@ impl ReadHalf {
       eof!(stream.read_buf(&mut self.buffer).await?);
     }
 
-    let fin = self.buffer[0] & 0b10000000 != 0;
-    let rsv1 = self.buffer[0] & 0b01000000 != 0;
-    let rsv2 = self.buffer[0] & 0b00100000 != 0;
-    let rsv3 = self.buffer[0] & 0b00010000 != 0;
+    let b0 = self.buffer[0];
+    let b1 = self.buffer[1];
 
-    if rsv1 || rsv2 || rsv3 {
+    if b0 & RSV_MASK != 0 {
       return Err(WebSocketError::ReservedBitsNotZero);
     }
 
-    let opcode = frame::OpCode::try_from(self.buffer[0] & 0b00001111)?;
-    let masked = self.buffer[1] & 0b10000000 != 0;
+    let fin = b0 & FIN_BIT != 0;
+    let opcode = frame::OpCode::try_from(b0 & OPCODE_MASK)?;
+    let masked = b1 & MASK_BIT != 0;
 
-    let length_code = self.buffer[1] & 0x7F;
+    let length_code = b1 & LEN_MASK;
     let extra = match length_code {
-      126 => 2,
-      127 => 8,
+      LEN_U16 => 2,
+      LEN_U64 => 8,
       _ => 0,
     };
 
@@ -748,7 +890,7 @@ impl ReadHalf {
       return Err(WebSocketError::ControlFrameFragmented);
     }
 
-    if opcode == OpCode::Ping && payload_len > 125 {
+    if opcode == OpCode::Ping && payload_len > MAX_CONTROL_PAYLOAD {
       return Err(WebSocketError::PingFrameTooLarge);
     }
 
