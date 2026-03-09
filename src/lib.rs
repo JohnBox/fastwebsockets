@@ -648,8 +648,6 @@ impl<'f, S> WebSocket<S> {
         None
       };
 
-      self.read_half.buffer.advance(2 + extra + mask_size);
-
       if frame::is_control(opcode) && !fin {
         return Err(WebSocketError::ControlFrameFragmented);
       }
@@ -662,11 +660,17 @@ impl<'f, S> WebSocket<S> {
         return Err(WebSocketError::FrameTooLarge);
       }
 
-      self.read_half.buffer.reserve(payload_len + MAX_HEADER_SIZE);
-      while payload_len > self.read_half.buffer.remaining() {
+      // Defer buffer consumption until ALL frame data (header + payload) is
+      // available.  This makes read_frame cancellation-safe: dropping the future
+      // at any await point leaves the buffer unchanged so a fresh call re-parses
+      // from the same position.
+      let header_size = 2 + extra + mask_size;
+      self.read_half.buffer.reserve(header_size + payload_len + MAX_HEADER_SIZE);
+      while self.read_half.buffer.remaining() < header_size + payload_len {
         eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
       }
 
+      self.read_half.buffer.advance(header_size);
       let payload = self.read_half.buffer.split_to(payload_len);
       let mut frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
 
@@ -925,8 +929,6 @@ impl ReadHalf {
       None
     };
 
-    self.buffer.advance(2 + extra + mask_size);
-
     if frame::is_control(opcode) && !fin {
       return Err(WebSocketError::ControlFrameFragmented);
     }
@@ -939,12 +941,17 @@ impl ReadHalf {
       return Err(WebSocketError::FrameTooLarge);
     }
 
-    // Reserve a bit more to try to get next frame header and avoid a syscall to read it next time
-    self.buffer.reserve(payload_len + MAX_HEADER_SIZE);
-    while payload_len > self.buffer.remaining() {
+    // Defer buffer consumption until ALL frame data (header + payload) is
+    // available.  This makes read_frame cancellation-safe: dropping the future
+    // at any await point leaves the buffer unchanged so a fresh call re-parses
+    // from the same position.
+    let header_size = 2 + extra + mask_size;
+    self.buffer.reserve(header_size + payload_len + MAX_HEADER_SIZE);
+    while self.buffer.remaining() < header_size + payload_len {
       eof!(stream.read_buf(&mut self.buffer).await?);
     }
 
+    self.buffer.advance(header_size);
     // if we read too much it will stay in the buffer, for the next call to this method
     let payload = self.buffer.split_to(payload_len);
     let frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
