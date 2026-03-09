@@ -369,6 +369,7 @@ repr_u8! {
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn is_control(opcode: OpCode) -> bool {
   matches!(opcode, OpCode::Close | OpCode::Ping | OpCode::Pong)
