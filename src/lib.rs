@@ -546,9 +546,9 @@ impl<'f, S> WebSocket<S> {
     flush(&mut self.stream).await
   }
 
-  /// Reads a text/binary frame payload from the stream.
+  /// Minimal fast-path variant of read_frame.
   ///
-  /// Minimal single-path hot loop: assumes Text opcode (0x1) and LEN_U16
+  /// Single-path hot loop: assumes Text opcode (0x1) and LEN_U16
   /// (length_code=126) — verified against live Solana RPC traffic (100% and
   /// 99.75% respectively). All other opcodes/lengths handled on cold paths.
   /// No RSV/FIN/mask/UTF-8/max_message_size checks.
@@ -556,7 +556,7 @@ impl<'f, S> WebSocket<S> {
   /// Initial buffer is 64 KB (max LEN_U16 payload) — zero heap allocations
   /// in steady state.
   #[inline(always)]
-  pub async fn read_frame(&mut self) -> Result<BytesMut, WebSocketError>
+  pub async fn read_frame_fast(&mut self) -> Result<BytesMut, WebSocketError>
   where
     S: AsyncRead + AsyncWrite + Unpin,
   {
@@ -628,22 +628,211 @@ impl<'f, S> WebSocket<S> {
       }
     }
   }
+
+  /// Reads a WebSocket frame from the stream, handling control frames automatically.
+  ///
+  /// This method is the full-featured frame reader with validation:
+  /// RSV bits, FIN, masking, UTF-8, max_message_size, close codes,
+  /// auto-pong, and auto-close handling.
+  ///
+  /// ```ignore
+  /// let frame = ws.read_frame().await?;
+  /// match frame.opcode {
+  ///   OpCode::Text | OpCode::Binary => {
+  ///     ws.write_frame(frame).await?;
+  ///   }
+  ///   _ => {}
+  /// }
+  /// ```
+  pub async fn read_frame(&mut self) -> Result<Frame<'f>, WebSocketError>
+  where
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
+    macro_rules! eof {
+      ($n:expr) => {{
+        if $n == 0 {
+          return Err(WebSocketError::UnexpectedEOF);
+        }
+      }};
+    }
+
+    loop {
+      // --- parse frame header ---
+      while self.read_half.buffer.remaining() < 2 {
+        eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
+      }
+
+      let base = self.read_half.buffer.chunk().as_ptr();
+      // SAFETY: remaining() >= 2 guaranteed above
+      let b0 = unsafe { *base };
+      let b1 = unsafe { *base.add(1) };
+
+      if b0 & RSV_MASK != 0 {
+        return Err(WebSocketError::ReservedBitsNotZero);
+      }
+
+      let fin = b0 & FIN_BIT != 0;
+      let opcode = frame::OpCode::try_from(b0 & OPCODE_MASK)?;
+      let masked = b1 & MASK_BIT != 0;
+
+      let length_code = b1 & LEN_MASK;
+      let extra: usize = match length_code {
+        LEN_U16 => 2,
+        LEN_U64 => 8,
+        _ => 0,
+      };
+      let mask_size = masked as usize * 4;
+
+      // Single wait for length + mask bytes (folded from two separate waits)
+      while self.read_half.buffer.remaining() < 2 + extra + mask_size {
+        eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
+      }
+
+      // Re-acquire pointer (read_buf may have reallocated)
+      let base = self.read_half.buffer.chunk().as_ptr();
+
+      // SAFETY: remaining() >= 2 + extra + mask_size guaranteed above
+      let payload_len: usize = match extra {
+        0 => usize::from(length_code),
+        2 => u16::from_be(unsafe {
+          ptr::read_unaligned(base.add(2) as *const u16)
+        }) as usize,
+        #[cfg(target_pointer_width = "64")]
+        8 => u64::from_be(unsafe {
+          ptr::read_unaligned(base.add(2) as *const u64)
+        }) as usize,
+        #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
+        8 => match usize::try_from(u64::from_be(unsafe {
+          ptr::read_unaligned(base.add(2) as *const u64)
+        })) {
+          Ok(length) => length,
+          Err(_) => return Err(WebSocketError::FrameTooLarge),
+        },
+        // SAFETY: extra is computed from length_code match; only 0, 2, 8 are possible
+        _ => unsafe { core::hint::unreachable_unchecked() },
+      };
+
+      let mask = if mask_size > 0 {
+        // SAFETY: remaining() >= 2 + extra + mask_size, so 4 bytes at offset 2+extra are valid
+        Some(unsafe {
+          ptr::read_unaligned(base.add(2 + extra) as *const [u8; 4])
+        })
+      } else {
+        None
+      };
+
+      if frame::is_control(opcode) && !fin {
+        return Err(WebSocketError::ControlFrameFragmented);
+      }
+
+      if opcode == OpCode::Ping && payload_len > MAX_CONTROL_PAYLOAD {
+        return Err(WebSocketError::PingFrameTooLarge);
+      }
+
+      if payload_len >= self.read_half.max_message_size {
+        return Err(WebSocketError::FrameTooLarge);
+      }
+
+      // Defer buffer consumption until ALL frame data (header + payload) is
+      // available.  This makes read_frame cancellation-safe: dropping the future
+      // at any await point leaves the buffer unchanged so a fresh call re-parses
+      // from the same position.
+      let header_size = 2 + extra + mask_size;
+      self.read_half.buffer.reserve(header_size + payload_len + MAX_HEADER_SIZE);
+      while self.read_half.buffer.remaining() < header_size + payload_len {
+        eof!(self.stream.read_buf(&mut self.read_half.buffer).await?);
+      }
+
+      self.read_half.buffer.advance(header_size);
+      let payload = self.read_half.buffer.split_to(payload_len);
+      let mut frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
+
+      // --- opcode dispatch ---
+      if self.read_half.role == Role::Server && self.read_half.auto_apply_mask {
+        frame.unmask();
+      }
+
+      match frame.opcode {
+        OpCode::Close if self.read_half.auto_close => {
+          match frame.payload.len() {
+            0 => {}
+            1 => return Err(WebSocketError::InvalidCloseFrame),
+            _ => {
+              let code = close::CloseCode::from(u16::from_be_bytes(
+                frame.payload[0..2].try_into().unwrap(),
+              ));
+
+              #[cfg(feature = "simd")]
+              if simdutf8::basic::from_utf8(&frame.payload[2..]).is_err() {
+                return Err(WebSocketError::InvalidUTF8);
+              };
+
+              #[cfg(not(feature = "simd"))]
+              if std::str::from_utf8(&frame.payload[2..]).is_err() {
+                return Err(WebSocketError::InvalidUTF8);
+              };
+
+              if !code.is_allowed() {
+                if !self.write_half.closed {
+                  self
+                    .write_half
+                    .write_frame(
+                      &mut self.stream,
+                      Frame::close(1002, &frame.payload[2..]),
+                    )
+                    .await?;
+                }
+                return Err(WebSocketError::InvalidCloseCode);
+              }
+            }
+          };
+
+          if !self.write_half.closed {
+            let reply = Frame::close_raw(frame.payload.to_owned().into());
+            self
+              .write_half
+              .write_frame(&mut self.stream, reply)
+              .await?;
+          }
+          return Ok(frame);
+        }
+        OpCode::Ping if self.read_half.auto_pong => {
+          if !self.write_half.closed {
+            self
+              .write_half
+              .write_frame(&mut self.stream, Frame::pong(frame.payload))
+              .await?;
+          }
+          continue;
+        }
+        OpCode::Text
+          if self.read_half.auto_validate_utf8
+            && frame.fin
+            && !frame.is_utf8() =>
+        {
+          return Err(WebSocketError::InvalidUTF8);
+        }
+        _ => {
+          if self.write_half.closed && frame.opcode != OpCode::Close {
+            return Err(WebSocketError::ConnectionClosed);
+          }
+          return Ok(frame);
+        }
+      }
+    }
+  }
 }
 
 const MAX_HEADER_SIZE: usize = 14;
 
 // WebSocket frame header bit masks and markers (RFC 6455 §5.2)
-#[allow(dead_code)]
 const FIN_BIT: u8 = 0x80;
-#[allow(dead_code)]
 const RSV_MASK: u8 = 0x70;
 const OPCODE_MASK: u8 = 0x0F;
-#[allow(dead_code)]
 const MASK_BIT: u8 = 0x80;
 const LEN_MASK: u8 = 0x7F;
 const LEN_U16: u8 = 126;
 const LEN_U64: u8 = 127;
-#[allow(dead_code)]
 const MAX_CONTROL_PAYLOAD: usize = 125;
 
 #[cold]
